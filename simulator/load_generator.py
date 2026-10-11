@@ -11,32 +11,78 @@ CONCURRENT_REQUESTS = 20
 
 
 
+
 async def send_request(
     client: httpx.AsyncClient,
     request_id: int,
 ):
     start = time.perf_counter()
+    first_token_time = None
+    previous_token_time = None
+    inter_token_latencies = []
+    token_count = 0
 
     try:
-        response = await client.post(
+        async with client.stream(
+            "POST",
             URL,
             params={
                 "prompt": f"Explain request {request_id}"
             },
-        )
+        ) as response:
 
-        if response.status_code == 503:
-            return None, "rejected"
+            if response.status_code == 503:
+                return {
+                    "status": "rejected",
+                    "latency": None,
+                    "ttft": None,
+                    "itl": [],
+                    "tokens": 0,
+                }
 
-        response.raise_for_status()
-        await response.aread()
+            response.raise_for_status()
 
-        latency = time.perf_counter() - start
-        return latency, "success"
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+
+                now = time.perf_counter()
+                token_count += 1
+
+                if first_token_time is None:
+                    first_token_time = now
+                else:
+                    inter_token_latencies.append(
+                        now - previous_token_time
+                    )
+
+                previous_token_time = now
+
+        end = time.perf_counter()
+
+        return {
+            "status": "success",
+            "latency": end - start,
+            "ttft": (
+                first_token_time - start
+                if first_token_time is not None
+                else None
+            ),
+            "itl": inter_token_latencies,
+            "tokens": token_count,
+        }
 
     except Exception as exc:
-        print(f"Request {request_id} failed unexpectedly: {exc}")
-        return None, "error"
+        print(f"Request {request_id} failed: {exc}")
+
+        return {
+            "status": "error",
+            "latency": None,
+            "ttft": None,
+            "itl": [],
+            "tokens": 0,
+        }
+
 
 
 
@@ -63,58 +109,93 @@ async def main():
     #Again list comprehension list = [ what u wanna insert() for loop conditional statements to be checked in the first statement]
     #for latency, suceess in results: if sucess = True : latencies.append(latency)
     
-    successful_latencies = [
-        latency
-        for latency, status in results
-        if status == "success"
+    
+    successful = [
+        result for result in results
+        if result["status"] == "success"
     ]
 
     rejected = sum(
-        status == "rejected"
-        for _, status in results
+        result["status"] == "rejected"
+        for result in results
     )
 
     errors = sum(
-        status == "error"
-        for _, status in results
+        result["status"] == "error"
+        for result in results
     )
 
-    successful = len(successful_latencies)
+    latencies = [
+        result["latency"] for result in successful
+    ]
+
+    ttfts = [
+        result["ttft"] for result in successful
+        if result["ttft"] is not None
+    ]
+
+    all_itls = [
+        itl
+        for result in successful
+        for itl in result["itl"]
+    ]
+
+    total_tokens = sum(
+        result["tokens"] for result in successful
+    )
+
+    def percentile(values, p):
+        values = sorted(values)
+        if not values:
+            return 0.0
+
+        index = min(int(len(values) * p), len(values) - 1)
+        return values[index]
 
     print()
     print("========== LOAD TEST RESULTS ==========")
     print(f"Total requests:      {CONCURRENT_REQUESTS}")
-    print(f"Successful requests: {successful}")
+    print(f"Successful requests: {len(successful)}")
     print(f"Rejected (503):      {rejected}")
     print(f"Unexpected errors:   {errors}")
     print(f"Total duration:      {total_time:.2f} sec")
 
     if successful:
-        throughput = successful / total_time
-        print(f"Throughput:          {throughput:.2f} req/sec")
+        print(
+            f"Request throughput:  "
+            f"{len(successful) / total_time:.2f} req/sec"
+        )
+        print(
+            f"Token throughput:    "
+            f"{total_tokens / total_time:.2f} tokens/sec"
+        )
         print(
             f"Average latency:     "
-            f"{statistics.mean(successful_latencies):.2f} sec"
-        )
-
-        sorted_latencies = sorted(successful_latencies)
-
-        def percentile(values, percentile):
-            index = int(len(values) * percentile)
-            index = min(index, len(values) - 1)
-            return values[index]
-
-        print(
-            f"p50 latency:         "
-            f"{percentile(sorted_latencies, 0.50):.2f} sec"
+            f"{statistics.mean(latencies):.3f} sec"
         )
         print(
             f"p95 latency:         "
-            f"{percentile(sorted_latencies, 0.95):.2f} sec"
+            f"{percentile(latencies, 0.95):.3f} sec"
+        )
+
+    if ttfts:
+        print(
+            f"Average TTFT:        "
+            f"{statistics.mean(ttfts) * 1000:.1f} ms"
         )
         print(
-            f"p99 latency:         "
-            f"{percentile(sorted_latencies, 0.99):.2f} sec"
+            f"p95 TTFT:             "
+            f"{percentile(ttfts, 0.95) * 1000:.1f} ms"
+        )
+
+    if all_itls:
+        print(
+            f"Average ITL:         "
+            f"{statistics.mean(all_itls) * 1000:.1f} ms"
+        )
+        print(
+            f"p95 ITL:              "
+            f"{percentile(all_itls, 0.95) * 1000:.1f} ms"
         )
 
 
